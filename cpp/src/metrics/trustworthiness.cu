@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019, NVIDIA CORPORATION.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,39 +14,59 @@
  * limitations under the License.
  */
 
-#include <cuda_utils.h>
-#include <common/cumlHandle.hpp>
-#include "distance/distance.h"
-#include "score/scores.h"
+#include <cuml/common/distance_type.hpp>
+#include <cuml/metrics/metrics.hpp>
+
+#include <raft/core/handle.hpp>
+
+#include <cuvs/distance/distance.hpp>
+#include <cuvs/stats/trustworthiness_score.hpp>
 
 namespace ML {
 namespace Metrics {
 
 /**
-        * @brief Compute the trustworthiness score
-        * @input param X: Data in original dimension
-        * @input param X_embedded: Data in target dimension (embedding)
-        * @input param n: Number of samples
-        * @input param m: Number of features in high/original dimension
-        * @input param d: Number of features in low/embedded dimension
-        * @input param n_neighbors: Number of neighbors considered by trustworthiness score
-        * @input tparam distance_type: Distance type to consider
-        * @return Trustworthiness score
-        */
-template <typename math_t, MLCommon::Distance::DistanceType distance_type>
-double trustworthiness_score(const cumlHandle& h, math_t* X, math_t* X_embedded,
-                             int n, int m, int d, int n_neighbors) {
-  cudaStream_t stream = h.getStream();
-  auto d_alloc = h.getDeviceAllocator();
-
-  return MLCommon::Score::trustworthiness_score<math_t, distance_type>(
-    X, X_embedded, n, m, d, n_neighbors, d_alloc, stream);
+ * @brief Compute the trustworthiness score
+ *
+ * @param h Raft handle
+ * @param X Data in original dimension
+ * @param X_embedded Data in target dimension (embedding)
+ * @param n Number of samples
+ * @param m Number of features in high/original dimension
+ * @param d Number of features in low/embedded dimension
+ * @param n_neighbors Number of neighbors considered by trustworthiness score
+ * @param batchSize Batch size
+ * @tparam distance_type: Distance type to consider
+ * @return Trustworthiness score
+ */
+template <typename math_t, ML::distance::DistanceType distance_type>
+double trustworthiness_score(const raft::handle_t& h,
+                             const math_t* X,
+                             math_t* X_embedded,
+                             int n,
+                             int m,
+                             int d,
+                             int n_neighbors,
+                             int batchSize)
+{
+  return cuvs::stats::trustworthiness_score(
+    h,
+    raft::make_device_matrix_view<const math_t, int64_t>(X, n, m),
+    raft::make_device_matrix_view<const math_t, int64_t>(X_embedded, n, d),
+    n_neighbors,
+    static_cast<cuvs::distance::DistanceType>(distance_type),
+    batchSize);
 }
 
-template double
-trustworthiness_score<float, MLCommon::Distance::EucUnexpandedL2Sqrt>(
-  const cumlHandle& h, float* X, float* X_embedded, int n, int m, int d,
-  int n_neighbors);
+template double trustworthiness_score<float, ML::distance::DistanceType::L2SqrtUnexpanded>(
+  const raft::handle_t& h,
+  const float* X,
+  float* X_embedded,
+  int n,
+  int m,
+  int d,
+  int n_neighbors,
+  int batchSize);
 
-};  //end namespace Metrics
-};  //end namespace ML
+};  // end namespace Metrics
+};  // end namespace ML

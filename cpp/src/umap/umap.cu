@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,96 +14,194 @@
  * limitations under the License.
  */
 
-#include "runner.h"
-#include "umap.hpp"
-#include "umapparams.h"
+#include "umap.cuh"
 
-#include <iostream>
+#include <rmm/device_buffer.hpp>
 
 namespace ML {
+namespace UMAP {
 
-static const int TPB_X = 32;
-
-void transform(const cumlHandle &handle, float *X, int n, int d, float *orig_X,
-               int orig_n, float *embedding, int embedding_n,
-               UMAPParams *params, float *transformed) {
-  UMAPAlgo::_transform<float, TPB_X>(handle, X, n, d, orig_X, orig_n, embedding,
-                                     embedding_n, params, transformed);
+void find_ab(const raft::handle_t& handle, UMAPParams* params)
+{
+  cudaStream_t stream = handle.get_stream();
+  UMAPAlgo::find_ab(params, stream);
 }
 
-void fit(const cumlHandle &handle,
-         float *X,  // input matrix
-         float *y,  // labels
-         int n, int d, UMAPParams *params, float *embeddings) {
-  UMAPAlgo::_fit<float, TPB_X>(handle, X, y, n, d, params, embeddings);
+std::unique_ptr<raft::sparse::COO<float, int>> get_graph(
+  const raft::handle_t& handle,
+  float* X,  // input matrix
+  float* y,  // labels
+  int n,
+  int d,
+  knn_indices_dense_t* knn_indices,  // precomputed indices
+  float* knn_dists,                  // precomputed distances
+  UMAPParams* params)
+{
+  if (dispatch_to_uint64_t(n, params->n_neighbors, params->n_components))
+    return _get_graph<uint64_t>(handle, X, y, n, d, knn_indices, knn_dists, params);
+  else
+    return _get_graph<int>(handle, X, y, n, d, knn_indices, knn_dists, params);
 }
 
-void fit(const cumlHandle &handle,
-         float *X,  // input matrix
-         int n,     // rows
-         int d,     // cols
-         UMAPParams *params, float *embeddings) {
-  UMAPAlgo::_fit<float, TPB_X>(handle, X, n, d, params, embeddings);
+void refine(const raft::handle_t& handle,
+            float* X,
+            int n,
+            int d,
+            raft::sparse::COO<float>* graph,
+            UMAPParams* params,
+            float* embeddings)
+{
+  if (dispatch_to_uint64_t(n, params->n_neighbors, params->n_components))
+    _refine<uint64_t>(handle, X, n, d, graph, params, embeddings);
+  else
+    _refine<int>(handle, X, n, d, graph, params, embeddings);
 }
 
-UMAP_API::UMAP_API(const cumlHandle &handle, UMAPParams *params)
-  : params(params) {
-  this->handle = const_cast<cumlHandle *>(&handle);
-  orig_X = nullptr;
-  orig_n = 0;
-};
-
-UMAP_API::~UMAP_API() {}
-
-/**
-     * Fits a UMAP model
-     * @param X
-     *        pointer to an array in row-major format (note: this will be col-major soon)
-     * @param n
-     *        n_samples in X
-     * @param d
-     *        d_features in X
-     * @param embeddings
-     *        an array to return the output embeddings of size (n_samples, n_components)
-     */
-void UMAP_API::fit(float *X, int n, int d, float *embeddings) {
-  this->orig_X = X;
-  this->orig_n = n;
-  UMAPAlgo::_fit<float, TPB_X>(*this->handle, X, n, d, get_params(),
-                               embeddings);
+void init_and_refine(const raft::handle_t& handle,
+                     float* X,
+                     int n,
+                     int d,
+                     raft::sparse::COO<float>* graph,
+                     UMAPParams* params,
+                     float* embeddings)
+{
+  if (dispatch_to_uint64_t(n, params->n_neighbors, params->n_components))
+    _init_and_refine<uint64_t>(handle, X, n, d, graph, params, embeddings);
+  else
+    _init_and_refine<int>(handle, X, n, d, graph, params, embeddings);
 }
 
-void UMAP_API::fit(float *X, float *y, int n, int d, float *embeddings) {
-  this->orig_X = X;
-  this->orig_n = n;
-  UMAPAlgo::_fit<float, TPB_X>(*this->handle, X, y, n, d, get_params(),
-                               embeddings);
+void fit(const raft::handle_t& handle,
+         float* X,
+         float* y,
+         int n,
+         int d,
+         knn_indices_dense_t* knn_indices,
+         float* knn_dists,
+         UMAPParams* params,
+         std::unique_ptr<rmm::device_buffer>& embeddings,
+         raft::host_coo_matrix<float, int, int, uint64_t>& graph)
+{
+  if (dispatch_to_uint64_t(n, params->n_neighbors, params->n_components))
+    _fit<uint64_t>(handle, X, y, n, d, knn_indices, knn_dists, params, embeddings, graph);
+  else
+    _fit<int>(handle, X, y, n, d, knn_indices, knn_dists, params, embeddings, graph);
 }
 
-/**
-     * Project a set of X vectors into the embedding space.
-     * @param X
-     *        pointer to an array in row-major format (note: this will be col-major soon)
-     * @param n
-     *        n_samples in X
-     * @param d
-     *        d_features in X
-     * @param embedding
-     *        pointer to embedding array of size (embedding_n, n_components) that has been created with fit()
-     * @param embedding_n
-     *        n_samples in embedding array
-     * @param out
-     *        pointer to array for storing output embeddings (n, n_components)
-     */
-void UMAP_API::transform(float *X, int n, int d, float *embedding,
-                         int embedding_n, float *out) {
-  UMAPAlgo::_transform<float, TPB_X>(*this->handle, X, n, d, this->orig_X,
-                                     this->orig_n, embedding, embedding_n,
-                                     get_params(), out);
+void fit_sparse(const raft::handle_t& handle,
+                int* indptr,
+                int* indices,
+                float* data,
+                size_t nnz,
+                float* y,
+                int n,
+                int d,
+                int* knn_indices,
+                float* knn_dists,
+                UMAPParams* params,
+                std::unique_ptr<rmm::device_buffer>& embeddings,
+                raft::host_coo_matrix<float, int, int, uint64_t>& graph)
+{
+  if (dispatch_to_uint64_t(n, params->n_neighbors, params->n_components))
+    _fit_sparse<uint64_t>(handle,
+                          indptr,
+                          indices,
+                          data,
+                          nnz,
+                          y,
+                          n,
+                          d,
+                          knn_indices,
+                          knn_dists,
+                          params,
+                          embeddings,
+                          graph);
+  else
+    _fit_sparse<int>(handle,
+                     indptr,
+                     indices,
+                     data,
+                     nnz,
+                     y,
+                     n,
+                     d,
+                     knn_indices,
+                     knn_dists,
+                     params,
+                     embeddings,
+                     graph);
 }
 
-/**
-     * Get the UMAPParams instance
-     */
-UMAPParams *UMAP_API::get_params() { return this->params; }
+void transform(const raft::handle_t& handle,
+               float* X,
+               int n,
+               int d,
+               float* orig_X,
+               int orig_n,
+               float* embedding,
+               int embedding_n,
+               UMAPParams* params,
+               float* transformed)
+{
+  if (dispatch_to_uint64_t(n, params->n_neighbors, params->n_components))
+    _transform<uint64_t>(
+      handle, X, n, d, orig_X, orig_n, embedding, embedding_n, params, transformed);
+  else
+    _transform<int>(handle, X, n, d, orig_X, orig_n, embedding, embedding_n, params, transformed);
+}
+
+void transform_sparse(const raft::handle_t& handle,
+                      int* indptr,
+                      int* indices,
+                      float* data,
+                      size_t nnz,
+                      int n,
+                      int d,
+                      int* orig_x_indptr,
+                      int* orig_x_indices,
+                      float* orig_x_data,
+                      size_t orig_nnz,
+                      int orig_n,
+                      float* embedding,
+                      int embedding_n,
+                      UMAPParams* params,
+                      float* transformed)
+{
+  if (dispatch_to_uint64_t(n, params->n_neighbors, params->n_components))
+    _transform_sparse<uint64_t>(handle,
+                                indptr,
+                                indices,
+                                data,
+                                nnz,
+                                n,
+                                d,
+                                orig_x_indptr,
+                                orig_x_indices,
+                                orig_x_data,
+                                orig_nnz,
+                                orig_n,
+                                embedding,
+                                embedding_n,
+                                params,
+                                transformed);
+  else
+    _transform_sparse<int>(handle,
+                           indptr,
+                           indices,
+                           data,
+                           nnz,
+                           n,
+                           d,
+                           orig_x_indptr,
+                           orig_x_indices,
+                           orig_x_data,
+                           orig_nnz,
+                           orig_n,
+                           embedding,
+                           embedding_n,
+                           params,
+                           transformed);
+}
+
+}  // namespace UMAP
 }  // namespace ML

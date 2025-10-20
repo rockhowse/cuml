@@ -7,12 +7,11 @@ traditional tabular ML tasks on GPUs without going into the details of CUDA
 programming. In most cases, cuML's Python API matches the API from
 [scikit-learn](https://scikit-learn.org).
 
-
 For large datasets, these GPU-based implementations can complete 10-50x faster
 than their CPU equivalents. For details on performance, see the [cuML Benchmarks
-Notebook](https://github.com/rapidsai/notebooks-contrib/blob/master/intermediate_notebooks/benchmarks/cuml_benchmarks.ipynb).
+Notebook](https://github.com/rapidsai/cuml/tree/branch-25.12/notebooks/tools).
 
-As an example, the following Python snippet loads input and computes DBSCAN clusters, all on GPU:
+As an example, the following Python snippet loads input and computes DBSCAN clusters, all on GPU, using cuDF:
 ```python
 import cudf
 from cuml.cluster import DBSCAN
@@ -38,13 +37,28 @@ Output:
 dtype: int32
 ```
 
-cuML also features multi-GPU and multi-node-multi-GPU operation, using [Dask](https://www.dask.org), for a 
-growing list of algorithms. The following Python snippet reads input from a CSV file and performs 
+cuML also features multi-GPU and multi-node-multi-GPU operation, using [Dask](https://www.dask.org), for a
+growing list of algorithms. The following Python snippet reads input from a CSV file and performs
 a NearestNeighbors query across a cluster of Dask workers, using multiple GPUs on a single node:
+
+
+Initialize a `LocalCUDACluster` configured with [UCXX](https://github.com/rapidsai/ucxx) for fast transport of CUDA arrays
 ```python
-# Create a Dask CUDA cluster w/ one worker per device
+# Initialize UCX for high-speed transport of CUDA arrays
 from dask_cuda import LocalCUDACluster
-cluster = LocalCUDACluster()
+
+# Create a Dask single-node CUDA cluster w/ one worker per device
+cluster = LocalCUDACluster(protocol="ucx",
+                           enable_tcp_over_ucx=True,
+                           enable_nvlink=True,
+                           enable_infiniband=False)
+```
+
+Load data and perform `k-Nearest Neighbors` search. `cuml.dask` estimators also support `Dask.Array` as input:
+```python
+
+from dask.distributed import Client
+client = Client(cluster)
 
 # Read CSV file in parallel across workers
 import dask_cudf
@@ -52,16 +66,15 @@ df = dask_cudf.read_csv("/path/to/csv")
 
 # Fit a NearestNeighbors model and query it
 from cuml.dask.neighbors import NearestNeighbors
-nn = NearestNeighbors(n_neighbors = 10)
+nn = NearestNeighbors(n_neighbors = 10, client=client)
 nn.fit(df)
 neighbors = nn.kneighbors(df)
 ```
 
-
 For additional examples, browse our complete [API
 documentation](https://docs.rapids.ai/api/cuml/stable/), or check out our
-introductory [walkthrough
-notebooks](https://github.com/rapidsai/notebooks/tree/master/cuml). Finally, you
+example [walkthrough
+notebooks](https://github.com/rapidsai/cuml/tree/branch-25.12/notebooks). Finally, you
 can find complete end-to-end examples in the [notebooks-contrib
 repo](https://github.com/rapidsai/notebooks-contrib).
 
@@ -69,44 +82,74 @@ repo](https://github.com/rapidsai/notebooks-contrib).
 ### Supported Algorithms
 | Category | Algorithm | Notes |
 | --- | --- | --- |
-| **Clustering** |  Density-Based Spatial Clustering of Applications with Noise (DBSCAN) | |
-|  | K-Means | Multi-Node Multi-GPU |
-| **Dimensionality Reduction** | Principal Components Analysis (PCA) | |
-| | Truncated Singular Value Decomposition (tSVD) | Multi-GPU version available (CUDA 10 only) |
-| | Uniform Manifold Approximation and Projection (UMAP) | |
+| **Clustering** |  Density-Based Spatial Clustering of Applications with Noise (DBSCAN) | Multi-node multi-GPU via Dask |
+|  | Hierarchical Density-Based Spatial Clustering of Applications with Noise (HDBSCAN)  | |
+|  | K-Means | Multi-node multi-GPU via Dask |
+|  | Single-Linkage Agglomerative Clustering | |
+| **Dimensionality Reduction** | Principal Components Analysis (PCA) | Multi-node multi-GPU via Dask|
+| | Incremental PCA | |
+| | Truncated Singular Value Decomposition (tSVD) | Multi-node multi-GPU via Dask |
+| | Uniform Manifold Approximation and Projection (UMAP) | Multi-node multi-GPU Inference via Dask |
 | | Random Projection | |
 | | t-Distributed Stochastic Neighbor Embedding (TSNE) | |
-| **Linear Models for Regression or Classification** | Linear Regression (OLS) | Multi-GPU available in conda CUDA 10 package |
-| | Linear Regression with Lasso or Ridge Regularization | |
+| | Spectral Embedding | |
+| **Linear Models for Regression or Classification** | Linear Regression (OLS) | Multi-node multi-GPU via Dask |
+| | Linear Regression with Lasso or Ridge Regularization | Multi-node multi-GPU via Dask |
 | | ElasticNet Regression | |
-| | Logistic Regression | |
+| | LARS Regression | (experimental) |
+| | Logistic Regression | Multi-node multi-GPU via Dask-GLM [demo](https://github.com/daxiongshu/rapids-demos) |
+| | Naive Bayes | Multi-node multi-GPU via Dask |
 | | Stochastic Gradient Descent (SGD), Coordinate Descent (CD), and Quasi-Newton (QN) (including L-BFGS and OWL-QN) solvers for linear models  | |
-| **Nonlinear Models for Regression or Classification** | Random Forest (RF) Classification | Experimental multi-node, multi-GPU version available via Dask integration |
-| | Random Forest (RF) Regression | Experimental multi-node, multi-GPU version available via Dask integration |
-|  | K-Nearest Neighbors (KNN) | Multi-GPU <br> Uses [Faiss](https://github.com/facebookresearch/faiss) |
+| **Nonlinear Models for Regression or Classification** | Random Forest (RF) Classification | Experimental multi-node multi-GPU via Dask |
+| | Random Forest (RF) Regression | Experimental multi-node multi-GPU via Dask |
+| | Inference for decision tree-based models | Forest Inference Library (FIL) |
+|  | K-Nearest Neighbors (KNN) Classification | Multi-node multi-GPU via Dask+[UCXX](https://github.com/rapidsai/ucxx), uses [Faiss](https://github.com/facebookresearch/faiss) for Nearest Neighbors Query. |
+|  | K-Nearest Neighbors (KNN) Regression | Multi-node multi-GPU via Dask+[UCXX](https://github.com/rapidsai/ucxx), uses [Faiss](https://github.com/facebookresearch/faiss) for Nearest Neighbors Query. |
 |  | Support Vector Machine Classifier (SVC) | |
-| **Time Series** | Linear Kalman Filter | |
-|  | Holt-Winters Exponential Smoothing | |
----
+|  | Epsilon-Support Vector Regression (SVR) | |
+| **Preprocessing** | Standardization, or mean removal and variance scaling / Normalization / Encoding categorical features / Discretization / Imputation of missing values / Polynomial features generation / and coming soon custom transformers and non-linear transformation | Based on Scikit-Learn preprocessing
+| **Time Series** | Holt-Winters Exponential Smoothing | |
+|  | Auto-regressive Integrated Moving Average (ARIMA) | Supports seasonality (SARIMA) |
+| **Model Explanation** | SHAP Kernel Explainer | [Based on SHAP](https://shap.readthedocs.io/en/latest/) |
+|  | SHAP Permutation Explainer | [Based on SHAP](https://shap.readthedocs.io/en/latest/) |
+| **Execution device interoperability** | | Run estimators interchangeably from host/cpu or device/gpu with minimal code change [demo](https://docs.rapids.ai/api/cuml/stable/execution_device_interoperability.html) |
+| **Other**                                             | K-Nearest Neighbors (KNN) Search                                                                                                          | Multi-node multi-GPU via Dask+[UCXX](https://github.com/rapidsai/ucxx), uses [Faiss](https://github.com/facebookresearch/faiss) for Nearest Neighbors Query. |
 
-More ML algorithms in cuML and more ML primitives in ml-prims are planned for
-future releases, including: spectral embedding, spectral clustering,
-support vector machines, and additional time series methods. Future releases
-will also expand support for multi-node, multi-GPU algorithms.
+---
 
 ## Installation
 
-See [the RAPIDS Release
-Selector](https://rapids.ai/start.html#rapids-release-selector) for the command
-line to install either nightly or official release cuML packages via Conda or
-Docker.
+See [the RAPIDS Release Selector](https://docs.rapids.ai/install#selector) for
+the command line to install either nightly or official release cuML packages
+via Conda or Docker.
 
 ## Build/Install from Source
 See the build [guide](BUILD.md).
 
+## Scikit-learn Compatibility
+
+cuML is compatible with scikit-learn version 1.4 or higher.
+
 ## Contributing
 
 Please see our [guide for contributing to cuML](CONTRIBUTING.md).
+
+## References
+
+The RAPIDS team has a number of blogs with deeper technical dives and examples. [You can find them here on Medium.](https://medium.com/rapids-ai/tagged/machine-learning)
+
+For additional details on the technologies behind cuML, as well as a broader overview of the Python Machine Learning landscape, see [_Machine Learning in Python: Main developments and technology trends in data science, machine learning, and artificial intelligence_ (2020)](https://arxiv.org/abs/2002.04803) by Sebastian Raschka, Joshua Patterson, and Corey Nolet.
+
+Please consider citing this when using cuML in a project. You can use the citation BibTeX:
+
+```bibtex
+@article{raschka2020machine,
+  title={Machine Learning in Python: Main developments and technology trends in data science, machine learning, and artificial intelligence},
+  author={Raschka, Sebastian and Patterson, Joshua and Nolet, Corey},
+  journal={arXiv preprint arXiv:2002.04803},
+  year={2020}
+}
+```
 
 ## Contact
 

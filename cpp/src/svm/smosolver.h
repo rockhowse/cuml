@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,33 +16,34 @@
 
 #pragma once
 
-#include <cuda_utils.h>
-#include <math.h>
+#include <cuml/common/logger.hpp>
+#include <cuml/svm/svm_model.h>
+
+#include <raft/core/handle.hpp>
+
+#include <rmm/device_scalar.hpp>
+#include <rmm/device_uvector.hpp>
+
+#include <thrust/device_ptr.h>
+
+#include <cuvs/distance/distance.hpp>
+#include <cuvs/distance/grammian.hpp>
+
+#include <cassert>
+#include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
-
-#include "common/cumlHandle.hpp"
-#include "kernelcache.h"
-#include "linalg/cublas_wrappers.h"
-#include "linalg/gemv.h"
-#include "linalg/unary_op.h"
-#include "matrix/grammatrix.h"
-#include "matrix/kernelfactory.h"
-#include "matrix/kernelparams.h"
-#include "smo_sets.h"
-#include "smoblocksolve.h"
-#include "workingset.h"
-#include "ws_util.h"
-
-#include "common/device_buffer.hpp"
-#include "results.h"
+#include <sstream>
+#include <string>
+#include <type_traits>
 
 namespace ML {
 namespace SVM {
 
 /**
- * Solve the quadratic optimization problem using two level decomposition and
- * Sequential Minimal Optimization (SMO).
+ * @brief Solve the quadratic optimization problem using two level decomposition
+ * and Sequential Minimal Optimization (SMO).
  *
  * The general decomposition idea by Osuna is to choose q examples from all the
  * training examples, and solve the QP problem for this subset (discussed in
@@ -68,209 +69,284 @@ namespace SVM {
 template <typename math_t>
 class SmoSolver {
  public:
-  bool verbose = false;
-  SmoSolver(const cumlHandle_impl &handle, math_t C, math_t tol,
-            MLCommon::Matrix::GramMatrixBase<math_t> *kernel,
-            float cache_size = 200, int nochange_steps = 1000)
+  SmoSolver(const raft::handle_t& handle,
+            SvmParameter param,
+            cuvs::distance::kernels::KernelType kernel_type,
+            cuvs::distance::kernels::GramMatrixBase<math_t>* kernel)
     : handle(handle),
-      n_rows(n_rows),
-      C(C),
-      tol(tol),
+      C(param.C),
+      tol(param.tol),
       kernel(kernel),
-      cache_size(cache_size),
-      nochange_steps(nochange_steps),
-      stream(handle.getStream()),
-      return_buff(handle.getDeviceAllocator(), stream, 2),
-      alpha(handle.getDeviceAllocator(), stream),
-      delta_alpha(handle.getDeviceAllocator(), stream),
-      f(handle.getDeviceAllocator(), stream) {}
+      kernel_type(kernel_type),
+      cache_size(param.cache_size),
+      nochange_steps(param.nochange_steps),
+      epsilon(param.epsilon),
+      svmType(param.svmType),
+      stream(handle.get_stream()),
+      return_buff(2, stream),
+      alpha(0, stream),
+      C_vec(0, stream),
+      delta_alpha(0, stream),
+      f(0, stream),
+      y_label(0, stream)
+  {
+    ML::default_logger().set_level(param.verbosity);
+  }
 
-#define SMO_WS_SIZE 1024
+  void GetNonzeroDeltaAlpha(const math_t* vec,
+                            int n_ws,
+                            const int* idx,
+                            math_t* nz_vec,
+                            int* n_nz,
+                            int* nz_idx,
+                            cudaStream_t stream);
   /**
-   * Solve the quadratic optimization problem.
+   * @brief Solve the quadratic optimization problem.
    *
-   * The output arrays (dual_coefs, x_support, idx) will be allocated on the
+   * The output arrays (dual_coefs, support_matrix, idx) will be allocated on the
    * device, they should be unallocated on entry.
    *
-   * @param [in] x training vectors in column major format, size [n_rows x n_cols]
+   * @param [in] matrix training vectors in matrix format(MLCommon::Matrix::Matrix),
+   * size [n_rows x * n_cols]
    * @param [in] n_rows number of rows (training vectors)
    * @param [in] n_cols number of columns (features)
    * @param [in] y labels (values +/-1), size [n_rows]
-   * @param [out] dual_coefs, size [n_support] on exit
+   * @param [in] sample_weight device array of sample weights (or nullptr if not
+   *     applicable)
+   * @param [out] dual_coefs size [n_support] on exit
    * @param [out] n_support number of support vectors
-   * @param [out] x_support support vectors in column major format, size [n_support, n_cols]
+   * @param [out] support_matrix support vectors in matrix format, size [n_support, n_cols]
    * @param [out] idx the original training set indices of the support vectors, size [n_support]
    * @param [out] b scalar constant for the decision function
-   * @param [in] max_out_iter maximum number of outer iteration (default 100 * n_rows)
-   * @param [in] xm_inner_iter maximum number of inner iterations (default 10000)
+   * @param [in] max_outer_iter maximum number of outer iteration (default 100 * n_rows)
+   * @param [in] max_inner_iter maximum number of inner iterations (default 10000)
    */
-  void Solve(math_t *x, int n_rows, int n_cols, math_t *y, math_t **dual_coefs,
-             int *n_support, math_t **x_support, int **idx, math_t *b,
-             int max_outer_iter = -1, int max_inner_iter = 10000) {
-    if (max_outer_iter == -1) {
-      max_outer_iter = n_rows < std::numeric_limits<int>::max() / 100
-                         ? n_rows * 100
-                         : std::numeric_limits<int>::max();
-      max_outer_iter = max(100000, max_outer_iter);
-    }
-
-    WorkingSet<math_t> ws(handle, stream, n_rows, SMO_WS_SIZE);
-    int n_ws = ws.GetSize();
-    ResizeBuffers(n_rows, n_cols, n_ws);
-    Initialize(y);
-
-    KernelCache<math_t> cache(handle, x, n_rows, n_cols, n_ws, kernel,
-                              cache_size);
-
-    int n_iter = 0;
-    int n_inner_iter = 0;
-    diff_prev = 0;
-    n_small_diff = 0;
-    bool keep_going = true;
-
-    while (n_iter < max_outer_iter && keep_going) {
-      CUDA_CHECK(
-        cudaMemsetAsync(delta_alpha.data(), 0, n_ws * sizeof(math_t), stream));
-      ws.Select(f.data(), alpha.data(), y, C);
-
-      math_t *cacheTile = cache.GetTile(ws.GetIndices());
-
-      SmoBlockSolve<math_t, SMO_WS_SIZE><<<1, n_ws, 0, stream>>>(
-        y, n_rows, alpha.data(), n_ws, delta_alpha.data(), f.data(), cacheTile,
-        ws.GetIndices(), C, tol, return_buff.data(), max_inner_iter);
-
-      CUDA_CHECK(cudaPeekAtLastError());
-
-      MLCommon::updateHost(host_return_buff, return_buff.data(), 2, stream);
-
-      UpdateF(f.data(), n_rows, delta_alpha.data(), n_ws, cacheTile);
-
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-
-      math_t diff = host_return_buff[0];
-      keep_going = CheckStoppingCondition(diff);
-
-      n_inner_iter += host_return_buff[1];
-      n_iter++;
-      if (verbose && n_iter % 500 == 0) {
-        std::cout << "SMO iteration " << n_iter << ", diff " << diff << "\n";
-      }
-    }
-
-    if (verbose) {
-      std::cout << "SMO solver finished after " << n_iter
-                << " outer iterations, " << n_inner_iter
-                << " total inner iterations, and diff " << diff_prev << "\n";
-    }
-    Results<math_t> res(handle, x, y, n_rows, n_cols, C);
-    res.Get(alpha.data(), f.data(), dual_coefs, n_support, idx, x_support, b);
-    ReleaseBuffers();
-  }
+  template <typename MatrixViewType>
+  void Solve(MatrixViewType matrix,
+             int n_rows,
+             int n_cols,
+             math_t* y,
+             const math_t* sample_weight,
+             math_t** dual_coefs,
+             int* n_support,
+             SupportStorage<math_t>* support_matrix,
+             int** idx,
+             math_t* b,
+             int max_outer_iter = -1,
+             int max_inner_iter = 10000);
 
   /**
-   * Update the f vector after a block solve step.
+   * @brief Update the f vector after a block solve step.
    *
    * \f[ f_i = f_i + \sum_{k\in WS} K_{i,k} * \Delta \alpha_k, \f]
-   * where i = [0..n_rows-1], WS is the set of workspace indices,
-   * and \f$K_{i,k}\f$ is the kernel function evaluated for training vector x_i and workspace vector x_k.
+   * where i = [0..n_train-1], WS is the set of workspace indices,
+   * and \f$K_{i,k}\f$ is the kernel function evaluated for training vector x_i and workspace vector
+   * x_k.
    *
-   * @param f size [n_rows]
+   * @param f size [n_train]
    * @param n_rows
    * @param delta_alpha size [n_ws]
    * @param n_ws
-   * @param cacheTile kernel function evaluated for the following set K[X,x_ws], size [n_rows, n_ws]
-   * @param cublas_handle
+   * @param cacheTile kernel function evaluated for the following set K[X,x_ws],
+   *   size [n_rows, n_ws]
    */
-  void UpdateF(math_t *f, int n_rows, const math_t *delta_alpha, int n_ws,
-               const math_t *cacheTile) {
-    math_t one =
-      1;  // multipliers used in the equation : f = 1*cachtile * delta_alpha + 1*f
-    CUBLAS_CHECK(MLCommon::LinAlg::cublasgemv(
-      handle.getCublasHandle(), CUBLAS_OP_N, n_rows, n_ws, &one, cacheTile,
-      n_rows, delta_alpha, 1, &one, f, 1, stream));
-  }
+  void UpdateF(math_t* f, int n_rows, const math_t* delta_alpha, int n_ws, const math_t* cacheTile);
 
-  /// Initialize the values of alpha and f
-  void Initialize(math_t *y) {
-    // we initialize alpha_i = 0 and
-    // f_i = -y_i
-    CUDA_CHECK(
-      cudaMemsetAsync(alpha.data(), 0, n_rows * sizeof(math_t), stream));
-    MLCommon::LinAlg::unaryOp(
-      f.data(), y, n_rows, [] __device__(math_t y) { return -y; }, stream);
-  }
+  /** @brief Initialize the problem to solve.
+   *
+   * Both SVC and SVR are solved as a classification problem.
+   * The optimization target (W) does not appear directly in the SMO
+   * formulation, only its derivative through f (optimality indicator vector):
+   * \f[ f_i = y_i \frac{\partial W }{\partial \alpha_i}. \f]
+   *
+   * The f_i values are initialized here, and updated at every solver iteration
+   * when alpha changes. The update step is the same for SVC and SVR, only the
+   * init step differs.
+   *
+   * Additionally, we zero init the dual coefficients (alpha), and initialize
+   * class labels for SVR.
+   *
+   * @param[inout] y on entry class labels or target values,
+   *    on exit device pointer to class labels
+   * @param[in] sample_weight sample weights (can be nullptr, otherwise device
+   *    array of size [n_rows])
+   * @param[in] n_rows
+   * @param[in] n_cols
+   */
+  void Initialize(math_t** y, const math_t* sample_weight, int n_rows, int n_cols);
+
+  void InitPenalty(math_t* C_vec, const math_t* sample_weight, int n_rows);
+
+  /** @brief Initialize Support Vector Classification
+   *
+   * We would like to maximize the following quantity
+   * \f[ W(\mathbf{\alpha}) = -\mathbf{\alpha}^T \mathbf{1}
+   *   + \frac{1}{2} \mathbf{\alpha}^T Q \mathbf{\alpha}, \f]
+   *
+   * We initialize f as:
+   * \f[ f_i = y_i \frac{\partial W(\mathbf{\alpha})}{\partial \alpha_i} =
+   *          -y_i +   y_j \alpha_j K(\mathbf{x}_i, \mathbf{x}_j) \f]
+   *
+   * @param [in] y device pointer of class labels size [n_rows]
+   */
+  void SvcInit(const math_t* y);
+
+  /**
+   * @brief Initializes the solver for epsilon-SVR.
+   *
+   * For regression we are optimizing the following quantity
+   * \f[
+   * W(\alpha^+, \alpha^-) =
+   * \epsilon \sum_{i=1}^l (\alpha_i^+ + \alpha_i^-)
+   * - \sum_{i=1}^l yc_i (\alpha_i^+ - \alpha_i^-)
+   * + \frac{1}{2} \sum_{i,j=1}^l
+   *   (\alpha_i^+ - \alpha_i^-)(\alpha_j^+ - \alpha_j^-) K(\bm{x}_i, \bm{x}_j)
+   * \f]
+   *
+   * Then \f$ f_i = y_i \frac{\partial W(\alpha}{\partial \alpha_i} \f$
+   *      \f$     = yc_i*epsilon - yr_i \f$
+   *
+   * Additionally we set class labels for the training vectors.
+   *
+   * References:
+   * [1] B. Schölkopf et. al (1998): New support vector algorithms,
+   *     NeuroCOLT2 Technical Report Series, NC2-TR-1998-031, Section 6
+   * [2] A.J. Smola, B. Schölkopf (2004): A tutorial on support vector
+   *     regression, Statistics and Computing 14, 199–222
+   * [3] Orchel M. (2011) Support Vector Regression as a Classification Problem
+   *     with a Priori Knowledge in the Form of Detractors,
+   *     Man-Machine Interactions 2. Advances in Intelligent and Soft Computing,
+   *     vol 103
+   *
+   * @param [in] yr device pointer with values for regression, size [n_rows]
+   * @param [in] n_rows
+   * @param [out] yc device pointer to classes associated to the dual
+   *     coefficients, size [n_rows*2]
+   * @param [out] f device pointer f size [n_rows*2]
+   */
+  void SvrInit(const math_t* yr, int n_rows, math_t* yc, math_t* f);
 
  private:
-  const cumlHandle_impl &handle;
+  const raft::handle_t& handle;
   cudaStream_t stream;
 
-  int n_rows = 0;  //!< training data number of rows
-  int n_cols = 0;  //!< training data number of columns
-  int n_ws = 0;    //!< size of the working set
+  int n_rows  = 0;  //!< training data number of rows
+  int n_cols  = 0;  //!< training data number of columns
+  int n_ws    = 0;  //!< size of the working set
+  int n_train = 0;  //!< number of training vectors (including duplicates for SVR)
 
-  // Buffers for the domain [n_rows]
-  MLCommon::device_buffer<math_t> alpha;  //!< dual coordinates
-  MLCommon::device_buffer<math_t> f;      //!< optimality indicator vector
+  // Buffers for the domain [n_train]
+  rmm::device_uvector<math_t> alpha;    //!< dual coordinates
+  rmm::device_uvector<math_t> f;        //!< optimality indicator vector
+  rmm::device_uvector<math_t> y_label;  //!< extra label for regression
+
+  rmm::device_uvector<math_t> C_vec;  //!< penalty parameter vector
 
   // Buffers for the working set [n_ws]
   //! change in alpha parameter during a blocksolve step
-  MLCommon::device_buffer<math_t> delta_alpha;
+  rmm::device_uvector<math_t> delta_alpha;
 
   // Buffers to return some parameters from the kernel (iteration number, and
   // convergence information)
-  MLCommon::device_buffer<math_t> return_buff;
+  rmm::device_uvector<math_t> return_buff;
   math_t host_return_buff[2];
 
   math_t C;
-  math_t tol;  //!< tolerance for stopping condition
+  math_t tol;      //!< tolerance for stopping condition
+  math_t epsilon;  //!< epsilon parameter for epsiolon-SVR
 
-  MLCommon::Matrix::GramMatrixBase<math_t> *kernel;
+  cuvs::distance::kernels::GramMatrixBase<math_t>* kernel;
+  cuvs::distance::kernels::KernelType kernel_type;
   float cache_size;  //!< size of kernel cache in MiB
+
+  SvmType svmType;  ///!< Type of the SVM problem to solve
 
   // Variables to track convergence of training
   math_t diff_prev;
   int n_small_diff;
   int nochange_steps;
+  int n_increased_diff;
+  int n_iter;
+  bool report_increased_diff;
 
-  bool CheckStoppingCondition(math_t diff) {
-    // TODO improve stopping condition to detect oscillations, see Issue #947
+  bool CheckStoppingCondition(math_t diff)
+  {
+    if (diff > diff_prev * 1.5 && n_iter > 0) {
+      // Ideally, diff should decrease monotonically. In practice we can have
+      // small fluctuations (10% increase is not uncommon). Here we consider a
+      // 50% increase in the diff value large enough to indicate a problem.
+      // The 50% value is an educated guess that triggers the convergence debug
+      // message for problematic use cases while avoids false alarms in many
+      // other cases.
+      n_increased_diff++;
+    }
+    if (report_increased_diff && n_iter > 100 && n_increased_diff > n_iter * 0.1) {
+      CUML_LOG_DEBUG(
+        "Solver is not converging monotonically. This might be caused by "
+        "insufficient normalization of the feature columns. In that case "
+        "MinMaxScaler((0,1)) could help. Alternatively, for nonlinear kernels, "
+        "you can try to increase the gamma parameter. To limit execution time, "
+        "you can also adjust the number of iterations using the max_iter "
+        "parameter.");
+      report_increased_diff = false;
+    }
     bool keep_going = true;
     if (abs(diff - diff_prev) < 0.001 * tol) {
       n_small_diff++;
     } else {
-      diff_prev = diff;
+      diff_prev    = diff;
       n_small_diff = 0;
     }
     if (n_small_diff > nochange_steps) {
-      if (verbose) {
-        std::cout << "SMO error: Stopping due to unchanged diff over "
-                  << nochange_steps << " consecutive steps\n";
-      }
+      CUML_LOG_ERROR(
+        "SMO error: Stopping due to unchanged diff over %d"
+        " consecutive steps",
+        nochange_steps);
       keep_going = false;
     }
     if (diff < tol) keep_going = false;
-    // ASSERT(!isnan(diff), "SMO: NaN found during fitting")
     if (isnan(diff)) {
-      std::cout << "SMO error: NaN found during fitting\n";
-      keep_going = false;
+      std::string txt;
+      if (std::is_same<float, math_t>::value) {
+        txt +=
+          " This might be caused by floating point overflow. In such case using"
+          " fp64 could help. Alternatively, try gamma='scale' kernel"
+          " parameter.";
+      }
+      THROW("SMO error: NaN found during fitting.%s", txt.c_str());
     }
     return keep_going;
   }
 
-  void ResizeBuffers(int n_rows, int n_cols, int n_ws) {
-    // This needs to know n_ws, therefore it can be only called during the solve step
-    this->n_rows = n_rows;
-    this->n_cols = n_cols;
-    this->n_ws = n_ws;
-    alpha.resize(n_rows, stream);
-    f.resize(n_rows, stream);
-    delta_alpha.resize(n_ws, stream);
+  /// Return the number of maximum iterations.
+  int GetDefaultMaxIter(int n_train, int max_outer_iter)
+  {
+    if (max_outer_iter == -1) {
+      max_outer_iter = n_train < std::numeric_limits<int>::max() / 100
+                         ? n_train * 100
+                         : std::numeric_limits<int>::max();
+      max_outer_iter = max(100000, max_outer_iter);
+    }
+    // else we have user defined iteration count which we do not change
+    return max_outer_iter;
   }
 
-  void ReleaseBuffers() {
-    alpha.release(stream);
-    delta_alpha.release(stream);
-    f.release(stream);
+  void ResizeBuffers(int n_train, int n_cols)
+  {
+    // This needs to know n_train, therefore it can be only called during solve
+    alpha.resize(n_train, stream);
+    C_vec.resize(n_train, stream);
+    f.resize(n_train, stream);
+    delta_alpha.resize(n_ws, stream);
+    if (svmType == EPSILON_SVR) y_label.resize(n_train, stream);
+  }
+
+  void ReleaseBuffers()
+  {
+    alpha.release();
+    delta_alpha.release();
+    f.release();
+    y_label.release();
   }
 };
 

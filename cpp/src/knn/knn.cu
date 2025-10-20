@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,234 +14,374 @@
  * limitations under the License.
  */
 
-#include "common/cumlHandle.hpp"
+#include <cuml/common/logger.hpp>
+#include <cuml/neighbors/knn.hpp>
 
-#include "knn.hpp"
+#include <raft/core/device_resources.hpp>
+#include <raft/core/handle.hpp>
+#include <raft/label/classlabels.cuh>
+#include <raft/spatial/knn/ann.cuh>
+#include <raft/spatial/knn/knn.cuh>
+#include <raft/util/cuda_utils.cuh>
 
-#include "ml_mg_utils.h"
-
-#include "selection/knn.h"
+#include <rmm/device_uvector.hpp>
 
 #include <cuda_runtime.h>
-#include "cuda_utils.h"
 
+#include <cuvs/neighbors/ball_cover.hpp>
+#include <cuvs/neighbors/brute_force.hpp>
+#include <cuvs/neighbors/ivf_flat.hpp>
+#include <cuvs/neighbors/ivf_pq.hpp>
+#include <cuvs/neighbors/knn_merge_parts.hpp>
+#include <ml_mg_utils.cuh>
+#include <selection/knn.cuh>
+
+#include <cstddef>
 #include <sstream>
 #include <vector>
 
 namespace ML {
 
-/**
-   * @brief Flat C++ API function to perform a brute force knn on
-   * a series of input arrays and combine the results into a single
-   * output array for indexes and distances.
-   *
-   * @param handle the cuml handle to use
-   * @param input an array of pointers to the input arrays
-   * @param sizes an array of sizes of input arrays
-   * @param n_params array size of input and sizes
-   * @param D the dimensionality of the arrays
-   * @param search_items array of items to search of dimensionality D
-   * @param n number of rows in search_items
-   * @param res_I the resulting index array of size n * k
-   * @param res_D the resulting distance array of size n * k
-   * @param k the number of nearest neighbors to return
-   */
-void brute_force_knn(cumlHandle &handle, float **input, int *sizes,
-                     int n_params, int D, float *search_items, int n,
-                     long *res_I, float *res_D, int k) {
-  MLCommon::Selection::brute_force_knn(input, sizes, n_params, D, search_items,
-                                       n, res_I, res_D, k,
-                                       handle.getImpl().getStream());
-}
+struct knnIndexImpl {
+  std::unique_ptr<cuvs::neighbors::ivf_flat::index<float, int64_t>> ivf_flat;
+  std::unique_ptr<cuvs::neighbors::ivf_pq::index<int64_t>> ivf_pq;
+};
 
-/**
-   * @brief A flat C++ API function that chunks a host array up into
-   * some number of different devices
-   *
-   * @param ptr an array on host to chunk
-   * @param n number of rows in host array
-   * @param D number of cols in host array
-   * @param devices array of devices to use
-   * @param output an array of output pointers to allocate and use
-   * @param sizes output array sizes
-   * @param n_chunks number of chunks to spread across device arrays
-   */
-void chunk_host_array(cumlHandle &handle, const float *ptr, int n, int D,
-                      int *devices, float **output, int *sizes, int n_chunks) {
-  chunk_to_device<float, int>(ptr, n, D, devices, output, sizes, n_chunks,
-                              handle.getImpl().getStream());
-}
+knnIndex::knnIndex() : pimpl{std::make_unique<knnIndexImpl>()} {}
+knnIndex::~knnIndex() = default;
 
-/**
-	 * Build a kNN object for training and querying a k-nearest neighbors model.
-	 * @param D 	number of features in each vector
-	 */
-kNN::kNN(const cumlHandle &handle, int D, bool verbose)
-  : D(D), total_n(0), indices(0), verbose(verbose), owner(false) {
-  this->handle = const_cast<cumlHandle *>(&handle);
-  sizes = nullptr;
-  ptrs = nullptr;
-}
+void brute_force_knn(const raft::handle_t& handle,
+                     std::vector<float*>& input,
+                     std::vector<int>& sizes,
+                     int D,
+                     float* search_items,
+                     int n,
+                     int64_t* res_I,
+                     float* res_D,
+                     int k,
+                     bool rowMajorIndex,
+                     bool rowMajorQuery,
+                     ML::distance::DistanceType metric,
+                     float metric_arg,
+                     std::vector<int64_t>* translations)
+{
+  ASSERT(input.size() == sizes.size(), "input and sizes vectors must be the same size");
 
-kNN::~kNN() {
-  try {
-    if (this->owner) {
-      if (this->verbose) std::cout << "Freeing kNN memory" << std::endl;
-      for (int i = 0; i < this->indices; i++) {
-        CUDA_CHECK(cudaFree(this->ptrs[i]));
-      }
+  // The cuvs api doesn't support having multiple input values to search against.
+  auto userStream = raft::resource::get_cuda_stream(handle);
+
+  ASSERT(input.size() == sizes.size(), "input and sizes vectors should be the same size");
+
+  std::vector<int64_t>* id_ranges;
+  if (translations == nullptr) {
+    // If we don't have explicit translations
+    // for offsets of the indices, build them
+    // from the local partitions
+    id_ranges       = new std::vector<int64_t>();
+    int64_t total_n = 0;
+    for (size_t i = 0; i < input.size(); i++) {
+      id_ranges->push_back(total_n);
+      total_n += sizes[i];
+    }
+  } else {
+    // otherwise, use the given translations
+    id_ranges = translations;
+  }
+
+  rmm::device_uvector<int64_t> trans(id_ranges->size(), userStream);
+  raft::update_device(trans.data(), id_ranges->data(), id_ranges->size(), userStream);
+
+  rmm::device_uvector<float> all_D(0, userStream);
+  rmm::device_uvector<int64_t> all_I(0, userStream);
+
+  float* out_D   = res_D;
+  int64_t* out_I = res_I;
+
+  if (input.size() > 1) {
+    all_D.resize(input.size() * k * n, userStream);
+    all_I.resize(input.size() * k * n, userStream);
+
+    out_D = all_D.data();
+    out_I = all_I.data();
+  }
+
+  // Make other streams from pool wait on main stream
+  raft::resource::wait_stream_pool_on_stream(handle);
+
+  for (size_t i = 0; i < input.size(); i++) {
+    float* out_d_ptr   = out_D + (i * k * n);
+    int64_t* out_i_ptr = out_I + (i * k * n);
+
+    auto stream         = raft::resource::get_next_usable_stream(handle, i);
+    auto current_handle = raft::device_resources(stream);
+
+    // build the brute_force index (precalculates norms etc)
+    std::optional<cuvs::neighbors::brute_force::index<float>> idx;
+    if (rowMajorIndex) {
+      idx = cuvs::neighbors::brute_force::build(
+        current_handle,
+        raft::make_device_matrix_view<const float, int64_t, raft::row_major>(input[i], sizes[i], D),
+        static_cast<cuvs::distance::DistanceType>(metric),
+        metric_arg);
+
+    } else {
+      idx = cuvs::neighbors::brute_force::build(
+        current_handle,
+        raft::make_device_matrix_view<const float, int64_t, raft::col_major>(input[i], sizes[i], D),
+        static_cast<cuvs::distance::DistanceType>(metric),
+        metric_arg);
     }
 
-  } catch (const std::exception &e) {
-    std::cout << "An exception occurred releasing kNN memory: " << e.what()
-              << std::endl;
-  }
-
-  delete ptrs;
-  delete sizes;
-}
-
-void kNN::reset() {
-  if (this->indices > 0) {
-    this->indices = 0;
-    this->total_n = 0;
-  }
-}
-
-/**
-	 * Fit a kNN model by creating separate indices for multiple given
-	 * instances of kNNParams.
-	 * @param input  an array of pointers to data on (possibly different) devices
-	 * @param N 	 number of items in input array.
-	 */
-void kNN::fit(float **input, int *sizes, int N) {
-  if (this->owner)
-    for (int i = 0; i < this->indices; i++) {
-      CUDA_CHECK(cudaFree(this->ptrs[i]));
+    // query the index
+    if (rowMajorQuery) {
+      cuvs::neighbors::brute_force::search(
+        current_handle,
+        *idx,
+        raft::make_device_matrix_view<const float, int64_t, raft::row_major>(search_items, n, D),
+        raft::make_device_matrix_view<int64_t, int64_t>(out_i_ptr, n, k),
+        raft::make_device_matrix_view<float, int64_t>(out_d_ptr, n, k));
+    } else {
+      cuvs::neighbors::brute_force::search(
+        current_handle,
+        *idx,
+        raft::make_device_matrix_view<const float, int64_t, raft::col_major>(search_items, n, D),
+        raft::make_device_matrix_view<int64_t, int64_t>(out_i_ptr, n, k),
+        raft::make_device_matrix_view<float, int64_t>(out_d_ptr, n, k));
     }
-
-  if (this->verbose) std::cout << "N=" << N << std::endl;
-
-  reset();
-
-  // TODO: Copy pointers!
-  this->indices = N;
-  this->ptrs = (float **)malloc(N * sizeof(float *));
-  this->sizes = (int *)malloc(N * sizeof(int));
-
-  for (int i = 0; i < N; i++) {
-    this->ptrs[i] = input[i];
-    this->sizes[i] = sizes[i];
   }
+
+  // Sync internal streams if used. We don't need to
+  // sync the user stream because we'll already have
+  // fully serial execution.
+  raft::resource::sync_stream_pool(handle);
+
+  if (input.size() > 1 || translations != nullptr) {
+    // This is necessary for proper index translations. If there are
+    // no translations or partitions to combine, it can be skipped.
+    // TODO: sort out where this knn_merge_parts should live
+    cuvs::neighbors::knn_merge_parts(
+      handle,
+      raft::make_device_matrix_view<const float, int64_t>(out_D, n * input.size(), k),
+      raft::make_device_matrix_view<const int64_t, int64_t>(out_I, n * input.size(), k),
+      raft::make_device_matrix_view<float, int64_t>(res_D, n, k),
+      raft::make_device_matrix_view<int64_t, int64_t>(res_I, n, k),
+      raft::make_device_vector_view<int64_t>(trans.data(), trans.size()));
+  }
+
+  if (translations == nullptr) delete id_ranges;
 }
 
-/**
-	 * Search the kNN for the k-nearest neighbors of a set of query vectors
-	 * @param search_items set of vectors to query for neighbors
-	 * @param n 		   number of items in search_items
-	 * @param res_I 	   pointer to device memory for returning k nearest indices
-	 * @param res_D		   pointer to device memory for returning k nearest distances
-	 * @param k			   number of neighbors to query
-	 */
-void kNN::search(float *search_items, int n, long *res_I, float *res_D, int k) {
-  MLCommon::Selection::brute_force_knn(ptrs, sizes, indices, D, search_items, n,
-                                       res_I, res_D, k,
-                                       handle->getImpl().getStream());
+void rbc_build_index(const raft::handle_t& handle,
+                     std::uintptr_t& rbc_index,
+                     float* X,
+                     int64_t n_rows,
+                     int64_t n_cols,
+                     ML::distance::DistanceType metric)
+{
+  auto X_view        = raft::make_device_matrix_view<const float, int64_t>(X, n_rows, n_cols);
+  auto rbc_index_ptr = new cuvs::neighbors::ball_cover::index<int64_t, float>(
+    handle, X_view, static_cast<cuvs::distance::DistanceType>(metric));
+  cuvs::neighbors::ball_cover::build(handle, *rbc_index_ptr);
+  rbc_index = reinterpret_cast<std::uintptr_t>(rbc_index_ptr);
 }
 
-/**
-     * Chunk a host array up into one or many GPUs (determined by the provided
-     * list of gpu ids) and fit a knn model.
-     *
-     * @param ptr       an array in host memory to chunk over devices
-     * @param n         number of elements in ptr
-     * @param devices   array of device ids for chunking the ptr
-     * @param n_chunks  number of elements in gpus
-     * @param out       host pointer (size n) to store output
+void rbc_knn_query(const raft::handle_t& handle,
+                   const std::uintptr_t& rbc_index,
+                   uint32_t k,
+                   const float* search_items,
+                   uint32_t n_search_items,
+                   int64_t dim,
+                   int64_t* out_inds,
+                   float* out_dists)
+{
+  auto rbc_index_ptr =
+    reinterpret_cast<cuvs::neighbors::ball_cover::index<int64_t, float>*>(rbc_index);
+  auto query_view =
+    raft::make_device_matrix_view<const float, int64_t>(search_items, n_search_items, dim);
+  auto indices_view = raft::make_device_matrix_view<int64_t, int64_t>(out_inds, n_search_items, k);
+  auto distances_view = raft::make_device_matrix_view<float, int64_t>(out_dists, n_search_items, k);
+  cuvs::neighbors::ball_cover::knn_query(
+    handle, *rbc_index_ptr, query_view, indices_view, distances_view, k);
+}
+
+void rbc_free_index(std::uintptr_t rbc_index)
+{
+  // Cast back to the original type and delete
+  auto rbc_index_ptr =
+    reinterpret_cast<cuvs::neighbors::ball_cover::index<int64_t, float>*>(rbc_index);
+  delete rbc_index_ptr;
+}
+
+void approx_knn_build_index(raft::handle_t& handle,
+                            knnIndex* index,
+                            knnIndexParam* params,
+                            ML::distance::DistanceType metric,
+                            float metricArg,
+                            float* index_array,
+                            int n,
+                            int D)
+{
+  index->metric    = metric;
+  index->metricArg = metricArg;
+
+  auto ivf_ft_pams = dynamic_cast<IVFFlatParam*>(params);
+  auto ivf_pq_pams = dynamic_cast<IVFPQParam*>(params);
+
+  index->metric_processor = raft::spatial::knn::create_processor<false, float>(
+    static_cast<raft::distance::DistanceType>(metric),
+    n,
+    D,
+    0,
+    raft::resource::get_cuda_stream(handle));
+  // For cosine/correlation distance, the metric processor translates distance
+  // to inner product via pre/post processing - pass the translated metric to
+  // ANN index
+  if (metric == ML::distance::DistanceType::CosineExpanded ||
+      metric == ML::distance::DistanceType::CorrelationExpanded) {
+    metric = index->metric = ML::distance::DistanceType::InnerProduct;
+  }
+  index->metric_processor->preprocess(index_array);
+  auto index_view = raft::make_device_matrix_view<const float, int64_t>(index_array, n, D);
+
+  if (ivf_ft_pams) {
+    index->nprobe = ivf_ft_pams->nprobe;
+    cuvs::neighbors::ivf_flat::index_params params;
+    params.metric     = static_cast<cuvs::distance::DistanceType>(metric);
+    params.metric_arg = metricArg;
+    params.n_lists    = ivf_ft_pams->nlist;
+
+    index->pimpl->ivf_flat = std::make_unique<cuvs::neighbors::ivf_flat::index<float, int64_t>>(
+      cuvs::neighbors::ivf_flat::build(handle, params, index_view));
+  } else if (ivf_pq_pams) {
+    index->nprobe = ivf_pq_pams->nprobe;
+    cuvs::neighbors::ivf_pq::index_params params;
+    params.metric     = static_cast<cuvs::distance::DistanceType>(metric);
+    params.metric_arg = metricArg;
+    params.n_lists    = ivf_pq_pams->nlist;
+    params.pq_bits    = ivf_pq_pams->n_bits;
+    params.pq_dim     = ivf_pq_pams->M;
+    // TODO: handle ivf_pq_pams.usePrecomputedTables ?
+
+    index->pimpl->ivf_pq = std::make_unique<cuvs::neighbors::ivf_pq::index<int64_t>>(
+      cuvs::neighbors::ivf_pq::build(handle, params, index_view));
+  } else {
+    RAFT_FAIL("Unrecognized index type.");
+  }
+
+  index->metric_processor->revert(index_array);
+}
+
+void approx_knn_search(raft::handle_t& handle,
+                       float* distances,
+                       int64_t* indices,
+                       knnIndex* index,
+                       int k,
+                       float* query_array,
+                       int n)
+{
+  index->metric_processor->preprocess(query_array);
+  index->metric_processor->set_num_queries(k);
+
+  auto indices_view   = raft::make_device_matrix_view<int64_t, int64_t>(indices, n, k);
+  auto distances_view = raft::make_device_matrix_view<float, int64_t>(distances, n, k);
+
+  if (index->pimpl->ivf_flat) {
+    auto query_view = raft::make_device_matrix_view<const float, int64_t>(
+      query_array, n, index->pimpl->ivf_flat->dim());
+    cuvs::neighbors::ivf_flat::search_params params;
+    params.n_probes = index->nprobe;
+
+    cuvs::neighbors::ivf_flat::search(
+      handle, params, *index->pimpl->ivf_flat, query_view, indices_view, distances_view);
+  } else if (index->pimpl->ivf_pq) {
+    auto query_view = raft::make_device_matrix_view<const float, int64_t>(
+      query_array, n, index->pimpl->ivf_pq->dim());
+    cuvs::neighbors::ivf_pq::search_params params;
+    params.n_probes = index->nprobe;
+
+    cuvs::neighbors::ivf_pq::search(
+      handle, params, *(index->pimpl->ivf_pq), query_view, indices_view, distances_view);
+  } else {
+    RAFT_FAIL("The model is not trained");
+  }
+
+  index->metric_processor->revert(query_array);
+
+  // perform post-processing to show the real distances
+  if (index->metric == ML::distance::DistanceType::L2SqrtExpanded ||
+      index->metric == ML::distance::DistanceType::L2SqrtUnexpanded ||
+      index->metric == ML::distance::DistanceType::LpUnexpanded) {
+    /**
+     * post-processing
      */
-void kNN::fit_from_host(float *ptr, int n, int *devices, int n_chunks) {
-  if (this->owner)
-    for (int i = 0; i < this->indices; i++) {
-      CUDA_CHECK(cudaFree(this->ptrs[i]));
-    }
-
-  reset();
-
-  this->owner = true;
-
-  float **params = new float *[n_chunks];
-  int *sizes = new int[n_chunks];
-
-  chunk_to_device<float>(ptr, n, D, devices, params, sizes, n_chunks,
-                         handle->getImpl().getStream());
-
-  fit(params, sizes, n_chunks);
-}
-};  // namespace ML
-
-/**
- * @brief Flat C API function to perform a brute force knn on
- * a series of input arrays and combine the results into a single
- * output array for indexes and distances.
- *
- * @param handle the cuml handle to use
- * @param input an array of pointers to the input arrays
- * @param sizes an array of sizes of input arrays
- * @param n_params array size of input and sizes
- * @param D the dimensionality of the arrays
- * @param search_items array of items to search of dimensionality D
- * @param n number of rows in search_items
- * @param res_I the resulting index array of size n * k
- * @param res_D the resulting distance array of size n * k
- * @param k the number of nearest neighbors to return
- */
-extern "C" cumlError_t knn_search(const cumlHandle_t handle, float **input,
-                                  int *sizes, int n_params, int D,
-                                  float *search_items, int n, long *res_I,
-                                  float *res_D, int k) {
-  cumlError_t status;
-
-  ML::cumlHandle *handle_ptr;
-  std::tie(handle_ptr, status) = ML::handleMap.lookupHandlePointer(handle);
-  if (status == CUML_SUCCESS) {
-    try {
-      MLCommon::Selection::brute_force_knn(input, sizes, n_params, D,
-                                           search_items, n, res_I, res_D, k,
-                                           handle_ptr->getImpl().getStream());
-    } catch (...) {
-      status = CUML_ERROR_UNKNOWN;
-    }
+    float p = 0.5;  // standard l2
+    if (index->metric == ML::distance::DistanceType::LpUnexpanded) p = 1.0 / index->metricArg;
+    raft::linalg::unaryOp<float>(distances,
+                                 distances,
+                                 n * k,
+                                 raft::pow_const_op<float>(p),
+                                 raft::resource::get_cuda_stream(handle));
   }
-  return status;
+  index->metric_processor->postprocess(distances);
 }
 
-/**
- * @brief A flat C api function that chunks a host array up into
- * some number of different devices
- *
- * @param ptr an array on host to chunk
- * @param n number of rows in host array
- * @param D number of cols in host array
- * @param devices array of devices to use
- * @param output an array of output pointers to allocate and use
- * @param sizes output array sizes
- * @param n_chunks number of chunks to spread across device arrays
- */
-extern "C" cumlError_t chunk_host_array(const cumlHandle_t handle,
-                                        const float *ptr, int n, int D,
-                                        int *devices, float **output,
-                                        int *sizes, int n_chunks) {
-  cumlError_t status;
-  ML::cumlHandle *handle_ptr;
-  std::tie(handle_ptr, status) = ML::handleMap.lookupHandlePointer(handle);
-  if (status == CUML_SUCCESS) {
-    try {
-      ML::chunk_to_device<float, int>(ptr, n, D, devices, output, sizes,
-                                      n_chunks,
-                                      handle_ptr->getImpl().getStream());
-    } catch (...) {
-      status = CUML_ERROR_UNKNOWN;
-    }
+void knn_classify(raft::handle_t& handle,
+                  int* out,
+                  int64_t* knn_indices,
+                  std::vector<int*>& y,
+                  size_t n_index_rows,
+                  size_t n_query_rows,
+                  int k)
+{
+  cudaStream_t stream = handle.get_stream();
+
+  std::vector<rmm::device_uvector<int>> uniq_labels_v;
+  std::vector<int*> uniq_labels(y.size());
+  std::vector<int> n_unique(y.size());
+
+  for (std::size_t i = 0; i < y.size(); i++) {
+    uniq_labels_v.emplace_back(0, stream);
+    n_unique[i]    = raft::label::getUniquelabels(uniq_labels_v.back(), y[i], n_index_rows, stream);
+    uniq_labels[i] = uniq_labels_v[i].data();
   }
-  return status;
+
+  MLCommon::Selection::knn_classify(
+    handle, out, knn_indices, y, n_index_rows, n_query_rows, k, uniq_labels, n_unique);
 }
+
+void knn_regress(raft::handle_t& handle,
+                 float* out,
+                 int64_t* knn_indices,
+                 std::vector<float*>& y,
+                 size_t n_index_rows,
+                 size_t n_query_rows,
+                 int k)
+{
+  MLCommon::Selection::knn_regress(handle, out, knn_indices, y, n_index_rows, n_query_rows, k);
+}
+
+void knn_class_proba(raft::handle_t& handle,
+                     std::vector<float*>& out,
+                     int64_t* knn_indices,
+                     std::vector<int*>& y,
+                     size_t n_index_rows,
+                     size_t n_query_rows,
+                     int k)
+{
+  cudaStream_t stream = handle.get_stream();
+
+  std::vector<rmm::device_uvector<int>> uniq_labels_v;
+  std::vector<int*> uniq_labels(y.size());
+  std::vector<int> n_unique(y.size());
+
+  for (std::size_t i = 0; i < y.size(); i++) {
+    uniq_labels_v.emplace_back(0, stream);
+    n_unique[i]    = raft::label::getUniquelabels(uniq_labels_v.back(), y[i], n_index_rows, stream);
+    uniq_labels[i] = uniq_labels_v[i].data();
+  }
+
+  MLCommon::Selection::class_probs(
+    handle, out, knn_indices, y, n_index_rows, n_query_rows, k, uniq_labels, n_unique);
+}
+
+};  // END NAMESPACE ML

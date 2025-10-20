@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, NVIDIA CORPORATION.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,113 +13,360 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "cuML.hpp"
-#include "glm.hpp"
-#include "glm/qn/qn.h"
-#include "ols.h"
-#include "ridge.h"
+
+#include "ols.cuh"
+#include "qn/qn.cuh"
+#include "ridge.cuh"
+
+#include <cuml/linear_model/glm.hpp>
+
+namespace raft {
+class handle_t;
+}
 
 namespace ML {
 namespace GLM {
 
-using namespace MLCommon;
-
-void olsFit(const cumlHandle &handle, float *input, int n_rows, int n_cols,
-            float *labels, float *coef, float *intercept, bool fit_intercept,
-            bool normalize, int algo) {
-  olsFit(handle.getImpl(), input, n_rows, n_cols, labels, coef, intercept,
-         fit_intercept, normalize, handle.getStream(), algo);
-  CUDA_CHECK(cudaStreamSynchronize(handle.getStream()));
+void olsFit(const raft::handle_t& handle,
+            float* input,
+            size_t n_rows,
+            size_t n_cols,
+            float* labels,
+            float* coef,
+            float* intercept,
+            bool fit_intercept,
+            bool normalize,
+            int algo,
+            float* sample_weight)
+{
+  detail::olsFit(handle,
+                 input,
+                 n_rows,
+                 n_cols,
+                 labels,
+                 coef,
+                 intercept,
+                 fit_intercept,
+                 normalize,
+                 algo,
+                 sample_weight);
 }
 
-void olsFit(const cumlHandle &handle, double *input, int n_rows, int n_cols,
-            double *labels, double *coef, double *intercept, bool fit_intercept,
-            bool normalize, int algo) {
-  olsFit(handle.getImpl(), input, n_rows, n_cols, labels, coef, intercept,
-         fit_intercept, normalize, handle.getStream(), algo);
-  CUDA_CHECK(cudaStreamSynchronize(handle.getStream()));
+void olsFit(const raft::handle_t& handle,
+            double* input,
+            size_t n_rows,
+            size_t n_cols,
+            double* labels,
+            double* coef,
+            double* intercept,
+            bool fit_intercept,
+            bool normalize,
+            int algo,
+            double* sample_weight)
+{
+  detail::olsFit(handle,
+                 input,
+                 n_rows,
+                 n_cols,
+                 labels,
+                 coef,
+                 intercept,
+                 fit_intercept,
+                 normalize,
+                 algo,
+                 sample_weight);
 }
 
-void olsPredict(const cumlHandle &handle, const float *input, int n_rows,
-                int n_cols, const float *coef, float intercept, float *preds) {
-  olsPredict(handle.getImpl(), input, n_rows, n_cols, coef, intercept, preds,
-             handle.getStream());
-  CUDA_CHECK(cudaStreamSynchronize(handle.getStream()));
+void gemmPredict(const raft::handle_t& handle,
+                 const float* input,
+                 size_t n_rows,
+                 size_t n_cols,
+                 const float* coef,
+                 float intercept,
+                 float* preds)
+{
+  detail::gemmPredict(handle, input, n_rows, n_cols, coef, intercept, preds);
 }
 
-void olsPredict(const cumlHandle &handle, const double *input, int n_rows,
-                int n_cols, const double *coef, double intercept,
-                double *preds) {
-  olsPredict(handle.getImpl(), input, n_rows, n_cols, coef, intercept, preds,
-             handle.getStream());
-  CUDA_CHECK(cudaStreamSynchronize(handle.getStream()));
+void gemmPredict(const raft::handle_t& handle,
+                 const double* input,
+                 size_t n_rows,
+                 size_t n_cols,
+                 const double* coef,
+                 double intercept,
+                 double* preds)
+{
+  detail::gemmPredict(handle, input, n_rows, n_cols, coef, intercept, preds);
 }
 
-void ridgeFit(const cumlHandle &handle, float *input, int n_rows, int n_cols,
-              float *labels, float *alpha, int n_alpha, float *coef,
-              float *intercept, bool fit_intercept, bool normalize, int algo) {
-  ridgeFit(handle.getImpl(), input, n_rows, n_cols, labels, alpha, n_alpha,
-           coef, intercept, fit_intercept, normalize, handle.getStream(), algo);
-  CUDA_CHECK(cudaStreamSynchronize(handle.getStream()));
+void ridgeFit(const raft::handle_t& handle,
+              float* input,
+              size_t n_rows,
+              size_t n_cols,
+              float* labels,
+              float* alpha,
+              int n_alpha,
+              float* coef,
+              float* intercept,
+              bool fit_intercept,
+              bool normalize,
+              int algo,
+              float* sample_weight)
+{
+  detail::ridgeFit(handle,
+                   input,
+                   n_rows,
+                   n_cols,
+                   labels,
+                   alpha,
+                   n_alpha,
+                   coef,
+                   intercept,
+                   fit_intercept,
+                   normalize,
+                   algo,
+                   sample_weight);
 }
 
-void ridgeFit(const cumlHandle &handle, double *input, int n_rows, int n_cols,
-              double *labels, double *alpha, int n_alpha, double *coef,
-              double *intercept, bool fit_intercept, bool normalize, int algo) {
-  ridgeFit(handle.getImpl(), input, n_rows, n_cols, labels, alpha, n_alpha,
-           coef, intercept, fit_intercept, normalize, handle.getStream(), algo);
-  CUDA_CHECK(cudaStreamSynchronize(handle.getStream()));
+void ridgeFit(const raft::handle_t& handle,
+              double* input,
+              size_t n_rows,
+              size_t n_cols,
+              double* labels,
+              double* alpha,
+              int n_alpha,
+              double* coef,
+              double* intercept,
+              bool fit_intercept,
+              bool normalize,
+              int algo,
+              double* sample_weight)
+{
+  detail::ridgeFit(handle,
+                   input,
+                   n_rows,
+                   n_cols,
+                   labels,
+                   alpha,
+                   n_alpha,
+                   coef,
+                   intercept,
+                   fit_intercept,
+                   normalize,
+                   algo,
+                   sample_weight);
 }
 
-void ridgePredict(const cumlHandle &handle, const float *input, int n_rows,
-                  int n_cols, const float *coef, float intercept,
-                  float *preds) {
-  ridgePredict(handle.getImpl(), input, n_rows, n_cols, coef, intercept, preds,
-               handle.getStream());
-  CUDA_CHECK(cudaStreamSynchronize(handle.getStream()));
+template <typename T, typename I>
+void qnFit(const raft::handle_t& cuml_handle,
+           const qn_params& pams,
+           T* X,
+           bool X_col_major,
+           T* y,
+           I N,
+           I D,
+           I C,
+           T* w0,
+           T* f,
+           int* num_iters,
+           T* sample_weight,
+           T svr_eps)
+{
+  detail::qnFit<T>(
+    cuml_handle, pams, X, X_col_major, y, N, D, C, w0, f, num_iters, sample_weight, svr_eps);
 }
 
-void ridgePredict(const cumlHandle &handle, const double *input, int n_rows,
-                  int n_cols, const double *coef, double intercept,
-                  double *preds) {
-  ridgePredict(handle.getImpl(), input, n_rows, n_cols, coef, intercept, preds,
-               handle.getStream());
-  CUDA_CHECK(cudaStreamSynchronize(handle.getStream()));
+template void qnFit<float>(const raft::handle_t&,
+                           const qn_params&,
+                           float*,
+                           bool,
+                           float*,
+                           int,
+                           int,
+                           int,
+                           float*,
+                           float*,
+                           int*,
+                           float*,
+                           float);
+template void qnFit<double>(const raft::handle_t&,
+                            const qn_params&,
+                            double*,
+                            bool,
+                            double*,
+                            int,
+                            int,
+                            int,
+                            double*,
+                            double*,
+                            int*,
+                            double*,
+                            double);
+
+template <typename T, typename I>
+void qnFitSparse(const raft::handle_t& cuml_handle,
+                 const qn_params& pams,
+                 T* X_values,
+                 I* X_cols,
+                 I* X_row_ids,
+                 I X_nnz,
+                 T* y,
+                 I N,
+                 I D,
+                 I C,
+                 T* w0,
+                 T* f,
+                 int* num_iters,
+                 T* sample_weight,
+                 T svr_eps)
+{
+  detail::qnFitSparse<T>(cuml_handle,
+                         pams,
+                         X_values,
+                         X_cols,
+                         X_row_ids,
+                         X_nnz,
+                         y,
+                         N,
+                         D,
+                         C,
+                         w0,
+                         f,
+                         num_iters,
+                         sample_weight,
+                         svr_eps);
 }
 
-void qnFit(const cumlHandle &cuml_handle, float *X, float *y, int N, int D,
-           int C, bool fit_intercept, float l1, float l2, int max_iter,
-           float grad_tol, int linesearch_max_iter, int lbfgs_memory,
-           int verbosity, float *w0, float *f, int *num_iters, bool X_col_major,
-           int loss_type) {
-  qnFit(cuml_handle.getImpl(), X, y, N, D, C, fit_intercept, l1, l2, max_iter,
-        grad_tol, linesearch_max_iter, lbfgs_memory, verbosity, w0, f,
-        num_iters, X_col_major, loss_type, cuml_handle.getStream());
+template void qnFitSparse<float>(const raft::handle_t&,
+                                 const qn_params&,
+                                 float*,
+                                 int*,
+                                 int*,
+                                 int,
+                                 float*,
+                                 int,
+                                 int,
+                                 int,
+                                 float*,
+                                 float*,
+                                 int*,
+                                 float*,
+                                 float);
+template void qnFitSparse<double>(const raft::handle_t&,
+                                  const qn_params&,
+                                  double*,
+                                  int*,
+                                  int*,
+                                  int,
+                                  double*,
+                                  int,
+                                  int,
+                                  int,
+                                  double*,
+                                  double*,
+                                  int*,
+                                  double*,
+                                  double);
+
+template <typename T, typename I>
+void qnDecisionFunction(const raft::handle_t& cuml_handle,
+                        const qn_params& pams,
+                        T* X,
+                        bool X_col_major,
+                        I N,
+                        I D,
+                        I C,
+                        T* params,
+                        T* scores)
+{
+  detail::qnDecisionFunction<T>(cuml_handle, pams, X, X_col_major, N, D, C, params, scores);
 }
 
-void qnFit(const cumlHandle &cuml_handle, double *X, double *y, int N, int D,
-           int C, bool fit_intercept, double l1, double l2, int max_iter,
-           double grad_tol, int linesearch_max_iter, int lbfgs_memory,
-           int verbosity, double *w0, double *f, int *num_iters,
-           bool X_col_major, int loss_type) {
-  qnFit(cuml_handle.getImpl(), X, y, N, D, C, fit_intercept, l1, l2, max_iter,
-        grad_tol, linesearch_max_iter, lbfgs_memory, verbosity, w0, f,
-        num_iters, X_col_major, loss_type, cuml_handle.getStream());
+template void qnDecisionFunction<float>(
+  const raft::handle_t&, const qn_params&, float*, bool, int, int, int, float*, float*);
+template void qnDecisionFunction<double>(
+  const raft::handle_t&, const qn_params&, double*, bool, int, int, int, double*, double*);
+
+template <typename T, typename I>
+void qnDecisionFunctionSparse(const raft::handle_t& cuml_handle,
+                              const qn_params& pams,
+                              T* X_values,
+                              I* X_cols,
+                              I* X_row_ids,
+                              I X_nnz,
+                              I N,
+                              I D,
+                              I C,
+                              T* params,
+                              T* scores)
+{
+  detail::qnDecisionFunctionSparse<T>(
+    cuml_handle, pams, X_values, X_cols, X_row_ids, X_nnz, N, D, C, params, scores);
 }
 
-void qnPredict(const cumlHandle &cuml_handle, float *X, int N, int D, int C,
-               bool fit_intercept, float *params, bool X_col_major,
-               int loss_type, float *preds) {
-  qnPredict(cuml_handle.getImpl(), X, N, D, C, fit_intercept, params,
-            X_col_major, loss_type, preds, cuml_handle.getStream());
+template void qnDecisionFunctionSparse<float>(
+  const raft::handle_t&, const qn_params&, float*, int*, int*, int, int, int, int, float*, float*);
+template void qnDecisionFunctionSparse<double>(const raft::handle_t&,
+                                               const qn_params&,
+                                               double*,
+                                               int*,
+                                               int*,
+                                               int,
+                                               int,
+                                               int,
+                                               int,
+                                               double*,
+                                               double*);
+
+template <typename T, typename I>
+void qnPredict(const raft::handle_t& cuml_handle,
+               const qn_params& pams,
+               T* X,
+               bool X_col_major,
+               I N,
+               I D,
+               I C,
+               T* params,
+               T* scores)
+{
+  detail::qnPredict<T>(cuml_handle, pams, X, X_col_major, N, D, C, params, scores);
 }
 
-void qnPredict(const cumlHandle &cuml_handle, double *X, int N, int D, int C,
-               bool fit_intercept, double *params, bool X_col_major,
-               int loss_type, double *preds) {
-  qnPredict(cuml_handle.getImpl(), X, N, D, C, fit_intercept, params,
-            X_col_major, loss_type, preds, cuml_handle.getStream());
+template void qnPredict<float>(
+  const raft::handle_t&, const qn_params&, float*, bool, int, int, int, float*, float*);
+template void qnPredict<double>(
+  const raft::handle_t&, const qn_params&, double*, bool, int, int, int, double*, double*);
+
+template <typename T, typename I>
+void qnPredictSparse(const raft::handle_t& cuml_handle,
+                     const qn_params& pams,
+                     T* X_values,
+                     I* X_cols,
+                     I* X_row_ids,
+                     I X_nnz,
+                     I N,
+                     I D,
+                     I C,
+                     T* params,
+                     T* preds)
+{
+  detail::qnPredictSparse<T>(
+    cuml_handle, pams, X_values, X_cols, X_row_ids, X_nnz, N, D, C, params, preds);
 }
+
+template void qnPredictSparse<float>(
+  const raft::handle_t&, const qn_params&, float*, int*, int*, int, int, int, int, float*, float*);
+template void qnPredictSparse<double>(const raft::handle_t&,
+                                      const qn_params&,
+                                      double*,
+                                      int*,
+                                      int*,
+                                      int,
+                                      int,
+                                      int,
+                                      int,
+                                      double*,
+                                      double*);
 
 }  // namespace GLM
 }  // namespace ML
